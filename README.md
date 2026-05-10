@@ -6,19 +6,36 @@
 <h3 align="center">The best-benchmarked open-source memory system for AI coding assistants.</h3>
 <p align="center">Every claim ships with the harness that proves it. Run the benchmarks yourself.</p>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg" alt="Python 3.11 | 3.12">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg" alt="Platform: macOS | Linux">
+  <img src="https://img.shields.io/badge/verbatim%20recall-%E2%89%A599%25%20at%2010k-brightgreen.svg" alt="Verbatim recall >= 99%">
+  <img src="https://img.shields.io/badge/p95%20latency-%3C100ms-brightgreen.svg" alt="p95 < 100ms">
+</p>
+
 ---
 
 # iai-mcp
 
 *Independent Autistic Intelligence — a local memory layer for Claude (and other MCP-compatible assistants).*
 
-## About the name
+## Table of contents
 
-*IAI* stands for Independent Autistic Intelligence.
-
-- **Independent.** Fully local. The daemon runs on your machine, embeddings are computed locally, no telemetry, no cloud dependency. Your memory is your data and stays your data.
-- **Autistic.** Describes the memory style, not a diagnosis or a metaphor. The memory is built around verbatim recall, attention to specific cues, and refusal to smooth rare events into typical ones. Most memory systems compress and summarize aggressively, aiming to give the assistant a *gist* of the past. This one preserves what was actually said and surfaces it on a precise cue. The trade-off is intentional: more storage and a stricter retrieval interface, in exchange for not losing details.
-- **Intelligence.** Used in the systems sense, something that observes, adapts, and stays viable over time, not the marketing sense.
+- [What it is](#what-it-is)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [How it works](#how-it-works)
+- [Benchmarks](#benchmarks)
+- [Configuration](#configuration)
+- [Doctor](#doctor)
+- [Notes for AI assistants](#notes-for-ai-assistants-helping-with-installation)
+- [Status and limitations](#status-and-limitations)
+- [Compatibility](#compatibility)
+- [About the name](#about-the-name)
+- [Authors](#authors)
+- [License](#license)
+- [Contributing](#contributing)
 
 ---
 
@@ -27,46 +44,6 @@
 A local server that speaks the [MCP protocol](https://modelcontextprotocol.io) and gives Claude, and any other MCP-compatible assistant, a long-term memory. It captures every turn of every session verbatim, organizes those captures over time into a personal map of who you are, and serves a small slice of relevant memory back at the start of each new conversation. You never have to say *"remember this"* or *"what did we say last time?"*.
 
 I built this for myself. It worked. I've been running it daily for months, and now I'm sharing it. The benchmarks were mostly for my own curiosity. I wanted to know if it actually works or if I'd just gotten used to it.
-
----
-
-## Usage
-
-You do not call `iai-mcp` directly during a session. Once it's connected:
-
-Capture is automatic. Every turn, yours and the assistant's, is recorded verbatim with timestamps and session metadata. You don't say *"remember this."*
-
-Recall is automatic. When a new session starts, the daemon assembles a small relevant slice of your history and injects it into the conversation prefix. You don't say *"what did we say."*
-
-Consolidation runs idle. Between sessions, the daemon merges duplicates, strengthens recall pathways for things retrieved often, and prunes weak edges. The system gets quietly better at remembering you over time.
-
-After a few weeks of regular use the difference becomes noticeable. The assistant stops asking the same orientation questions, references things you mentioned in passing, and adapts to your style without being told.
-
----
-
-## How it works
-
-The daemon is a Python process that runs in the background. Your MCP client connects to it via a Unix socket. No network exposure.
-
-Memory is stored in three tiers:
-
-*Episodic* is verbatim, timestamped fragments of what was said. Write-once, never overwritten or rewritten.
-
-*Semantic* is summaries induced from clusters of related episodes during idle-time consolidation.
-
-*Procedural* is a small set of stable parameters about you, learned over time: preferences, style cues, recurring patterns. Eleven sealed knobs that shift based on what works.
-
-A background pass runs periodically (sleep cycles): it clusters episodes, builds semantic summaries, decays old unreinforced connections, and reinforces frequently co-retrieved paths. Things you haven't revisited fade naturally. There's an optional "insight of the day" step that makes one Anthropic API call, but it's off by default.
-
-Recall combines three signals: semantic similarity, graph-link strength, and recency. All ranked together.
-
-All records are encrypted at rest with AES-256-GCM. The key lives in `~/.iai-mcp/.key` (mode 0600). Back it up. Lose the key, lose the memories.
-
-Everything lives at `~/.iai-mcp/`. Embeddings are computed locally with `bge-small-en-v1.5`. The only data that leaves the machine is your normal conversation with whatever LLM API your client uses.
-
-```
-Claude Code  <--MCP-stdio-->  TypeScript wrapper  <--UNIX socket-->  Python daemon  <-->  LanceDB
-```
 
 ---
 
@@ -179,6 +156,84 @@ You should see a `rc=0` line. That's your first memory.
 
 ---
 
+## Usage
+
+You do not call `iai-mcp` directly during a session. Once it's connected:
+
+Capture is automatic. Every turn, yours and the assistant's, is recorded verbatim with timestamps and session metadata. You don't say *"remember this."*
+
+Recall is automatic. When a new session starts, the daemon assembles a small relevant slice of your history and injects it into the conversation prefix. You don't say *"what did we say."*
+
+Consolidation runs idle. Between sessions, the daemon merges duplicates, strengthens recall pathways for things retrieved often, and prunes weak edges. The system gets quietly better at remembering you over time.
+
+After a few weeks of regular use the difference becomes noticeable. The assistant stops asking the same orientation questions, references things you mentioned in passing, and adapts to your style without being told.
+
+---
+
+## How it works
+
+The daemon is a Python process that runs in the background. Your MCP client connects to it via a Unix socket. No network exposure.
+
+Memory is stored in three tiers:
+
+*Episodic* is verbatim, timestamped fragments of what was said. Write-once, never overwritten or rewritten.
+
+*Semantic* is summaries induced from clusters of related episodes during idle-time consolidation.
+
+*Procedural* is a small set of stable parameters about you, learned over time: preferences, style cues, recurring patterns. Eleven sealed knobs that shift based on what works.
+
+A background pass runs periodically (sleep cycles): it clusters episodes, builds semantic summaries, decays old unreinforced connections, and reinforces frequently co-retrieved paths. Things you haven't revisited fade naturally. There's an optional "insight of the day" step that makes one Anthropic API call, but it's off by default.
+
+Recall combines three signals: semantic similarity, graph-link strength, and recency. All ranked together.
+
+All records are encrypted at rest with AES-256-GCM. The key lives in `~/.iai-mcp/.key` (mode 0600). Back it up. Lose the key, lose the memories.
+
+Everything lives at `~/.iai-mcp/`. Embeddings are computed locally with `bge-small-en-v1.5`. The only data that leaves the machine is your normal conversation with whatever LLM API your client uses.
+
+```
+Claude Code  <--MCP-stdio-->  TypeScript wrapper  <--UNIX socket-->  Python daemon  <-->  LanceDB
+```
+
+---
+
+## Benchmarks
+
+I made these because I wanted honest numbers. Every harness ships in `bench/`. Run them on your machine, get your own results.
+
+| Metric | Target | Measured |
+|---|---|---|
+| Verbatim recall (byte-exact) | >=99% | >=99% at N=10k |
+| Recall p95 latency | <100 ms | <100 ms at N=10k |
+| RAM at steady state | <=300 MB | ~150-300 MB |
+| Session-start tokens (warm cache) | <=3,000 | <=3,000 |
+| Session-start tokens (cold) | <=8,000 | <=8,000 |
+
+```bash
+python -m bench.verbatim                     # verbatim fidelity
+python -m bench.neural_map                   # recall latency
+python -m bench.memory_footprint             # RAM usage
+python -m bench.tokens                       # session-start cost
+python -m bench.total_session_cost           # full 10-turn cost
+python -m bench.trajectory                   # 30-session corpus
+python -m bench.contradiction_longitudinal   # falsifiability
+python -m bench.longmemeval_blind            # LongMemEval-S blind run
+```
+
+The LongMemEval-S run is blind on purpose. No dataset-specific tuning, no hyperparameter sweep. The numbers are what they are.
+
+---
+
+## Configuration
+
+| Variable | Default | What it does |
+|---|---|---|
+| `IAI_MCP_STORE` | `~/.iai-mcp/` | Data directory |
+| `IAI_MCP_EMBED_MODEL` | `bge-small-en-v1.5` | Embedding model. `bge-m3` for multilingual at ~3x size. |
+
+Switching embedders requires re-embedding the store: `iai-mcp migrate reembed`.
+
+---
+
 ## Doctor
 
 `iai-mcp doctor` runs 14 checks against the daemon, the store, and the runtime state. Output is one line per check: PASS, WARN, or FAIL.
@@ -230,44 +285,6 @@ When in doubt, run `iai-mcp doctor` and read what it says. The output is self-ex
 
 ---
 
-## Benchmarks
-
-I made these because I wanted honest numbers. Every harness ships in `bench/`. Run them on your machine, get your own results.
-
-| Metric | Target | Measured |
-|---|---|---|
-| Verbatim recall (byte-exact) | >=99% | >=99% at N=10k |
-| Recall p95 latency | <100 ms | <100 ms at N=10k |
-| RAM at steady state | <=300 MB | ~150-300 MB |
-| Session-start tokens (warm cache) | <=3,000 | <=3,000 |
-| Session-start tokens (cold) | <=8,000 | <=8,000 |
-
-```bash
-python -m bench.verbatim                     # verbatim fidelity
-python -m bench.neural_map                   # recall latency
-python -m bench.memory_footprint             # RAM usage
-python -m bench.tokens                       # session-start cost
-python -m bench.total_session_cost           # full 10-turn cost
-python -m bench.trajectory                   # 30-session corpus
-python -m bench.contradiction_longitudinal   # falsifiability
-python -m bench.longmemeval_blind            # LongMemEval-S blind run
-```
-
-The LongMemEval-S run is blind on purpose. No dataset-specific tuning, no hyperparameter sweep. The numbers are what they are.
-
----
-
-## Configuration
-
-| Variable | Default | What it does |
-|---|---|---|
-| `IAI_MCP_STORE` | `~/.iai-mcp/` | Data directory |
-| `IAI_MCP_EMBED_MODEL` | `bge-small-en-v1.5` | Embedding model. `bge-m3` for multilingual at ~3x size. |
-
-Switching embedders requires re-embedding the store: `iai-mcp migrate reembed`.
-
----
-
 ## Status and limitations
 
 This is experimental. I built it for myself, it works on my machine, and I'm sharing it because it might be useful to you. No SLA, no support guarantee. Breaking changes are possible between versions. Pin a commit hash if you depend on stability.
@@ -291,6 +308,16 @@ Claude Desktop should work (uses `claude_desktop_config.json` instead of `~/.cla
 Other MCP-over-stdio hosts speak the same protocol and should work in principle. Not tested.
 
 If you get it running on something else, open an issue or PR.
+
+---
+
+## About the name
+
+*IAI* stands for Independent Autistic Intelligence.
+
+- **Independent.** Fully local. The daemon runs on your machine, embeddings are computed locally, no telemetry, no cloud dependency. Your memory is your data and stays your data.
+- **Autistic.** Describes the memory style, not a diagnosis or a metaphor. The memory is built around verbatim recall, attention to specific cues, and refusal to smooth rare events into typical ones. Most memory systems compress and summarize aggressively, aiming to give the assistant a *gist* of the past. This one preserves what was actually said and surfaces it on a precise cue. The trade-off is intentional: more storage and a stricter retrieval interface, in exchange for not losing details.
+- **Intelligence.** Used in the systems sense, something that observes, adapts, and stays viable over time, not the marketing sense.
 
 ---
 
