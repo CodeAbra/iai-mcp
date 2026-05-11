@@ -60,7 +60,7 @@ I built this for myself. It worked. I've been running it daily for months, and n
 - macOS (Apple Silicon tested)
 - Python 3.11 or 3.12
 - Node.js 18+
-- [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) as the MCP host
+- [Claude Code](https://docs.claude.com/en/docs/claude-code/overview) or Codex CLI as the MCP host
 - ~500 MB free disk
 
 Windows and Linux not supported yet but I'm working on it.
@@ -82,9 +82,35 @@ export PATH="$HOME/.local/bin:$PATH"  # add to ~/.zshrc or ~/.bashrc
 iai-mcp --version
 ```
 
-### Install the Stop hook
+### Install the capture hook
 
 This is what makes capture ambient. Without it you'd have to save memories by hand.
+
+Claude Code is the default target:
+
+```bash
+iai-mcp capture-hooks install
+```
+
+For Codex:
+
+```bash
+iai-mcp capture-hooks install --target codex
+```
+
+To install both:
+
+```bash
+iai-mcp capture-hooks install --target all
+```
+
+Check status with:
+
+```bash
+iai-mcp capture-hooks status --target all
+```
+
+Manual Claude Code setup is equivalent to:
 
 ```bash
 mkdir -p ~/.claude/hooks
@@ -112,7 +138,9 @@ Register in `~/.claude/settings.json`:
 }
 ```
 
-### Connect Claude
+### Connect your MCP host
+
+Claude Code:
 
 ```bash
 claude mcp add iai-mcp -- node "$(pwd)/mcp-wrapper/dist/index.js"
@@ -134,6 +162,24 @@ Or edit `~/.claude.json` directly:
 Use the absolute path. `~` and `$HOME` won't expand here.
 
 For Claude Desktop (untested), edit `~/Library/Application Support/Claude/claude_desktop_config.json`.
+
+Codex CLI:
+
+```toml
+[mcp_servers.iai-mcp]
+command = "node"
+args = ["/absolute/path/to/iai-mcp/mcp-wrapper/dist/index.js"]
+
+[mcp_servers.iai-mcp.env]
+IAI_MCP_PYTHON = "/absolute/path/to/iai-mcp/.venv/bin/python"
+IAI_MCP_STORE = "/Users/you/.iai-mcp"
+TRANSFORMERS_VERBOSITY = "error"
+TOKENIZERS_PARALLELISM = "false"
+```
+
+Codex hooks are stable in current Codex CLI builds. If hooks are disabled by
+local policy or an older install, enable `[features].hooks = true` in
+`~/.codex/config.toml`.
 
 ### Verify
 
@@ -300,6 +346,8 @@ Limitations worth knowing about:
 Claude Code is the primary host, validated in daily use.
 
 Claude Desktop should work (uses `claude_desktop_config.json` instead of `~/.claude.json`) but hasn't been tested end to end.
+
+Codex CLI supports the MCP wrapper and ambient capture through a `Stop` hook.
 
 Other MCP-over-stdio hosts speak the same protocol and should work in principle. Not tested.
 

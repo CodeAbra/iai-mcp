@@ -726,12 +726,26 @@ def _capture_hook_paths() -> tuple[Path, Path, Path]:
     """Return (hook_src_in_repo, hook_dst_in_home, settings_path)."""
     from pathlib import Path as _P
     import iai_mcp
+
     pkg_dir = _P(iai_mcp.__file__).resolve().parent
     # repo layout: <repo>/src/iai_mcp/cli.py -> <repo>/deploy/hooks/...
     repo_root = pkg_dir.parent.parent
     src = repo_root / "deploy" / "hooks" / "iai-mcp-session-capture.sh"
     dst = _P.home() / ".claude" / "hooks" / "iai-mcp-session-capture.sh"
     settings = _P.home() / ".claude" / "settings.json"
+    return src, dst, settings
+
+
+def _codex_capture_hook_paths() -> tuple[Path, Path, Path]:
+    """Return (hook_src_in_repo, hook_dst_in_home, codex_hooks_json)."""
+    from pathlib import Path as _P
+    import iai_mcp
+
+    pkg_dir = _P(iai_mcp.__file__).resolve().parent
+    repo_root = pkg_dir.parent.parent
+    src = repo_root / "deploy" / "hooks" / "iai-mcp-codex-session-capture.sh"
+    dst = _P.home() / ".codex" / "hooks" / "iai-mcp-codex-session-capture.sh"
+    settings = _P.home() / ".codex" / "hooks.json"
     return src, dst, settings
 
 
@@ -817,7 +831,7 @@ def _patch_claude_desktop_config(action: str) -> str:
             servers.pop("iai-mcp", None)
             cfg_path.write_text(_json.dumps(data, indent=2))
             return f"Claude Desktop: removed iai-mcp from {cfg_path}"
-        return f"Claude Desktop: iai-mcp not in config — no change"
+        return "Claude Desktop: iai-mcp not in config — no change"
 
     # install
     new_entry = _build_iai_mcp_server_entry(repo_root)
@@ -829,6 +843,7 @@ def _patch_claude_desktop_config(action: str) -> str:
 
 
 _CAPTURE_HOOK_MARKER = "iai-mcp-session-capture.sh"
+_CODEX_CAPTURE_HOOK_MARKER = "iai-mcp-codex-session-capture.sh"
 
 
 def _load_settings(path):
@@ -841,14 +856,123 @@ def _load_settings(path):
         return {}
 
 
+def _target_from_args(args: argparse.Namespace) -> str:
+    return str(getattr(args, "target", "claude") or "claude")
+
+
+def _target_includes(target: str, name: str) -> bool:
+    return target == "all" or target == name
+
+
+def _patch_codex_hooks_config(action: str, command: str | None = None) -> str:
+    """Install/uninstall the Codex Stop hook in ~/.codex/hooks.json."""
+    import json as _json
+
+    _, dst, settings = _codex_capture_hook_paths()
+    data = _load_settings(settings)
+    if not isinstance(data, dict):
+        data = {}
+    hooks = data.setdefault("hooks", {})
+    stop_list = hooks.setdefault("Stop", [])
+
+    def has_marker(entry: dict) -> bool:
+        return any(
+            _CODEX_CAPTURE_HOOK_MARKER in (h.get("command") or "")
+            for h in (entry.get("hooks") or [])
+        )
+
+    if action == "uninstall":
+        kept = [entry for entry in stop_list if not has_marker(entry)]
+        if len(kept) == len(stop_list):
+            return f"Codex: no Stop entry to remove in {settings}"
+        if kept:
+            hooks["Stop"] = kept
+        else:
+            hooks.pop("Stop", None)
+        if not hooks:
+            data.pop("hooks", None)
+        settings.write_text(_json.dumps(data, indent=2))
+        return f"Codex: patched {settings} (Stop hook removed)"
+
+    if any(has_marker(entry) for entry in stop_list):
+        return f"Codex: {settings} already has Stop hook - no change"
+
+    stop_list.append({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": command or f"bash {dst}",
+            "timeout": 35,
+        }],
+    })
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(_json.dumps(data, indent=2))
+    return f"Codex: patched {settings} (Stop hook registered)"
+
+
+def _install_codex_capture_hook() -> int:
+    """Install the Codex Stop hook without touching Claude config."""
+    import shlex
+    import shutil
+    import stat
+
+    src, dst, _settings = _codex_capture_hook_paths()
+    if not src.exists():
+        print(f"ERROR: hook template missing in repo: {src}", file=sys.stderr)
+        return 1
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+    print(f"Codex: installed {dst}")
+    print(_patch_codex_hooks_config("install", f"bash {shlex.quote(str(dst))}"))
+    return 0
+
+
+def _uninstall_codex_capture_hook() -> int:
+    """Remove the Codex Stop hook script and config entry."""
+    _, dst, _settings = _codex_capture_hook_paths()
+    if dst.exists():
+        dst.unlink()
+        print(f"Codex: removed {dst}")
+    else:
+        print(f"Codex: not present {dst}")
+    print(_patch_codex_hooks_config("uninstall"))
+    return 0
+
+
+def _codex_capture_hook_status() -> bool:
+    """Print and return whether the Codex Stop hook is installed and wired."""
+    src, dst, settings = _codex_capture_hook_paths()
+    print(f"Codex template: {src}  {'PRESENT' if src.exists() else 'MISSING'}")
+    print(f"Codex installed: {dst}  {'PRESENT' if dst.exists() else 'MISSING'}")
+    data = _load_settings(settings)
+    stop_list = data.get("hooks", {}).get("Stop", [])
+    wired = any(
+        any(_CODEX_CAPTURE_HOOK_MARKER in (h.get("command") or "")
+            for h in (entry.get("hooks") or []))
+        for entry in stop_list
+    )
+    print(f"Codex hooks.json: {settings}  {'WIRED' if wired else 'NOT WIRED'}")
+    return dst.exists() and wired
+
+
 def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
     """Copy the Stop hook into ~/.claude/hooks/ and register it in settings.json."""
     import json as _json
     import shutil
     import stat
 
-    src, dst, settings = _capture_hook_paths()
+    target = _target_from_args(args)
+    if _target_includes(target, "codex") and _install_codex_capture_hook() != 0:
+        return 1
+    if not _target_includes(target, "claude"):
+        print("\nNext: restart Codex so it picks up the hook registration.")
+        print("If hooks are disabled by policy, enable [features].hooks = true.")
+        print("Verify: iai-mcp capture-hooks status --target codex")
+        return 0
 
+    src, dst, settings = _capture_hook_paths()
     if not src.exists():
         print(f"ERROR: hook template missing in repo: {src}", file=sys.stderr)
         return 1
@@ -871,7 +995,7 @@ def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
         for entry in stop_list
     )
     if already:
-        print(f"settings.json already has Stop hook — no change")
+        print("settings.json already has Stop hook — no change")
     else:
         stop_list.append({"hooks": [{"type": "command", "command": hook_cmd, "timeout": 35}]})
         settings.write_text(_json.dumps(data, indent=2))
@@ -882,8 +1006,12 @@ def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
     desktop_msg = _patch_claude_desktop_config("install")
     print(desktop_msg)
 
-    print("\nNext: fully quit + relaunch Claude Code AND Claude Desktop")
-    print("      so both pick up the registration (macOS: `killall Claude`).")
+    if _target_includes(target, "codex"):
+        print("\nNext: restart Codex, Claude Code, and Claude Desktop.")
+        print("If Codex hooks are disabled by policy, enable [features].hooks = true.")
+    else:
+        print("\nNext: fully quit + relaunch Claude Code AND Claude Desktop")
+        print("      so both pick up the registration (macOS: `killall Claude`).")
     print("Verify: iai-mcp capture-hooks status")
     return 0
 
@@ -892,8 +1020,13 @@ def cmd_capture_hooks_uninstall(args: argparse.Namespace) -> int:
     """Remove the Stop hook script and its settings.json entry (idempotent)."""
     import json as _json
 
-    _, dst, settings = _capture_hook_paths()
+    target = _target_from_args(args)
+    if _target_includes(target, "codex"):
+        _uninstall_codex_capture_hook()
+    if not _target_includes(target, "claude"):
+        return 0
 
+    _, dst, settings = _capture_hook_paths()
     if dst.exists():
         dst.unlink()
         print(f"removed: {dst}")
@@ -928,8 +1061,19 @@ def cmd_capture_hooks_uninstall(args: argparse.Namespace) -> int:
 def cmd_capture_hooks_status(args: argparse.Namespace) -> int:
     """Show whether the Stop hook is installed and active on both surfaces."""
     import json as _json
-    src, dst, settings = _capture_hook_paths()
 
+    target = _target_from_args(args)
+    codex_ok = True
+    if _target_includes(target, "codex"):
+        codex_ok = _codex_capture_hook_status()
+        if not _target_includes(target, "claude"):
+            if codex_ok:
+                print("\nstatus: ACTIVE - Codex ambient capture will fire on Stop")
+                return 0
+            print("\nstatus: INACTIVE - Codex not fully wired. Run: iai-mcp capture-hooks install --target codex")
+            return 1
+
+    src, dst, settings = _capture_hook_paths()
     print(f"repo template: {src}  {'PRESENT' if src.exists() else 'MISSING'}")
     print(f"installed at:  {dst}  {'PRESENT' if dst.exists() else 'MISSING'}")
 
@@ -966,13 +1110,15 @@ def cmd_capture_hooks_status(args: argparse.Namespace) -> int:
     # Desktop IS installed but not wired.
     desktop_problem = desktop_cfg is not None and desktop_cfg.exists() and not desktop_wired
 
-    if ok and not desktop_problem:
-        print(f"\nstatus: ACTIVE — ambient capture will fire on every SessionEnd "
+    if ok and not desktop_problem and codex_ok:
+        print(f"\nstatus: ACTIVE — ambient capture will fire on every Stop event "
               f"(Claude Code{'; Desktop also wired' if desktop_wired else ''})")
         return 0
     msg = []
     if not ok:
         msg.append("Claude Code not fully wired")
+    if not codex_ok:
+        msg.append("Codex not fully wired")
     if desktop_problem:
         msg.append("Claude Desktop present but iai-mcp not registered")
     print(f"\nstatus: INACTIVE — {'; '.join(msg)}. Run: iai-mcp capture-hooks install")
@@ -2257,8 +2403,6 @@ def cmd_maintenance_sleep_cycle(args: argparse.Namespace) -> int:
     runs CLI-only in — daemon coexistence is the Phase
     10.4/10.5 wiring concern.
     """
-    from datetime import timezone as _tz
-
     from iai_mcp.lifecycle_event_log import LifecycleEventLog
     from iai_mcp.lifecycle_state import LIFECYCLE_STATE_PATH
     from iai_mcp.sleep_pipeline import SleepPipeline, SleepStep
@@ -2549,25 +2693,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     cap.set_defaults(func=cmd_capture_transcript)
 
-    # Plan 06 ambient-capture installer: drops the Stop hook into
-    # ~/.claude/hooks/ and patches ~/.claude/settings.json. Makes a fresh
+    # Plan 06 ambient-capture installer: drops the Stop hook into Claude Code
+    # or Codex hook config. Makes a fresh
     # install of iai-mcp on another machine a two-step flow:
     #   pip install -e ".[dev,compress]"
     #   iai-mcp capture-hooks install
     ch = sub.add_parser(
         "capture-hooks",
-        help="install/uninstall/status the Claude Code Stop hook for ambient session capture",
+        help="install/uninstall/status Stop hooks for ambient session capture",
     )
     ch_sub = ch.add_subparsers(dest="capture_hooks_cmd", required=True)
-    ch_sub.add_parser("install",
-                      help="copy Stop hook to ~/.claude/hooks/ and register in settings.json"
-                      ).set_defaults(func=cmd_capture_hooks_install)
-    ch_sub.add_parser("uninstall",
-                      help="remove the Stop hook and its settings.json entry"
-                      ).set_defaults(func=cmd_capture_hooks_uninstall)
-    ch_sub.add_parser("status",
-                      help="show whether the Stop hook is installed and active"
-                      ).set_defaults(func=cmd_capture_hooks_status)
+    for name, helptext, func in (
+        ("install", "copy and register the Stop hook", cmd_capture_hooks_install),
+        ("uninstall", "remove the Stop hook and config entry", cmd_capture_hooks_uninstall),
+        ("status", "show whether the Stop hook is installed and active", cmd_capture_hooks_status),
+    ):
+        hook_cmd = ch_sub.add_parser(name, help=helptext)
+        hook_cmd.add_argument(
+            "--target",
+            choices=["claude", "codex", "all"],
+            default="claude",
+            help="hook target to manage (default: claude)",
+        )
+        hook_cmd.set_defaults(func=func)
 
     # audit subcommand + sub-subcommands.
     a = sub.add_parser(
