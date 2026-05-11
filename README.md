@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/encryption-AES--256--GCM-green.svg" alt="AES-256-GCM">
   <img src="https://img.shields.io/badge/local--only-no%20telemetry-green.svg" alt="Local only, no telemetry">
   <img src="https://img.shields.io/badge/MCP-compatible-purple.svg" alt="MCP compatible">
+  <a href="https://glama.ai/mcp/servers/CodeAbra/iai-mcp"><img src="https://glama.ai/mcp/servers/CodeAbra/iai-mcp/badges/score.svg" alt="Glama MCP score"></a>
 </p>
 
 ---
