@@ -35,7 +35,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 # R3 deviation [Rule 3 - blocking import cost]: `iai_mcp.embed` pulls
 # in transformers + torch (~2.9s cold import). Loading capture.py for the
@@ -80,6 +80,47 @@ def _run_shield(text: str) -> tuple[str, list[str]]:
         return verdict, tags
     except Exception:
         return "OK", []
+
+
+def _content_to_text(content: Any) -> str:
+    """Extract plain text from Claude and Codex content block shapes."""
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in {"text", "input_text", "output_text"}:
+                text_parts.append(str(block.get("text", "")))
+        return "\n".join(text_parts).strip()
+    return str(content).strip()
+
+
+def _extract_transcript_turn(obj: dict[str, Any]) -> tuple[str, str] | None:
+    """Return (role, text) for supported Claude Code and Codex transcript rows."""
+    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+    obj_type = obj.get("type")
+
+    if obj_type == "response_item":
+        # Codex response_item message rows can include injected context and
+        # duplicate cleaner event_msg rows. Capture only event_msg turns.
+        return None
+
+    if obj_type == "event_msg":
+        payload_type = payload.get("type")
+        if payload_type == "user_message":
+            text = _content_to_text(payload.get("message", ""))
+            return ("user", text) if text else None
+        if payload_type == "agent_message":
+            text = _content_to_text(payload.get("message", ""))
+            return ("assistant", text) if text else None
+        return None
+
+    msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+    role = obj_type if obj_type in {"user", "assistant"} else str(msg.get("role", ""))
+    if role not in {"user", "assistant"}:
+        return None
+    text = _content_to_text(msg.get("content", ""))
+    return (role, text) if text else None
 
 
 def capture_turn(
@@ -229,22 +270,10 @@ def capture_transcript(
             except Exception:
                 counts["errors"] += 1
                 continue
-            msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
-            role = obj.get("type") or msg.get("role", "")
-            if role not in {"user", "assistant"}:
+            turn = _extract_transcript_turn(obj)
+            if turn is None:
                 continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                # Claude Code messages use block format; collect text blocks
-                text_parts = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                text = "\n".join(text_parts).strip()
-            else:
-                text = str(content).strip()
-            if not text:
-                continue
+            role, text = turn
             result = capture_turn(
                 store,
                 cue=f"session {session_id} turn {seen}",
@@ -340,22 +369,10 @@ def write_deferred_captures(
                     obj = json.loads(line)
                 except Exception:
                     continue
-                msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
-                role = obj.get("type") or msg.get("role", "")
-                if role not in {"user", "assistant"}:
+                turn = _extract_transcript_turn(obj)
+                if turn is None:
                     continue
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    text_parts = [
-                        b.get("text", "")
-                        for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    text = "\n".join(text_parts).strip()
-                else:
-                    text = str(content).strip()
-                if not text:
-                    continue
+                role, text = turn
                 event = {
                     "text": text,
                     "cue": f"session {session_id} turn {seen}",

@@ -111,6 +111,35 @@ def _make_transcript(tmp_path: Path) -> Path:
     return transcript_path
 
 
+def _make_codex_transcript(tmp_path: Path) -> Path:
+    turns = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "noisy injected instructions should not be captured",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "codex event user turn"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "agent_message", "message": "codex assistant turn"},
+        },
+    ]
+    transcript_path = tmp_path / "codex-transcript.jsonl"
+    transcript_path.write_text("\n".join(json.dumps(t) for t in turns) + "\n")
+    return transcript_path
+
+
 def _run_no_spawn(env: dict[str, str], transcript_path: Path) -> subprocess.CompletedProcess:
     """Invoke `iai-mcp capture-transcript --no-spawn <transcript>` via
     `python -m iai_mcp.cli`. 5s wall-clock budget — comfortably above the 2s
@@ -230,6 +259,26 @@ def test_no_spawn_unreachable_still_defers(tmp_path):
 
     files = sorted(deferred_dir.glob("*.jsonl"))
     assert len(files) == 1, f"expected 1 deferred file, got {files}"
+
+
+def test_no_spawn_extracts_codex_transcript_turns(tmp_path):
+    env, deferred_dir, _sock_path = _isolated_env(tmp_path)
+    transcript = _make_codex_transcript(tmp_path)
+
+    proc = _run_no_spawn(env, transcript)
+
+    assert proc.returncode == 0, f"stderr={proc.stderr!r} stdout={proc.stdout!r}"
+    payload = json.loads(proc.stdout.strip())
+    assert payload.get("status") == "deferred", payload
+
+    files = sorted(deferred_dir.glob("*.jsonl"))
+    assert len(files) == 1, f"expected 1 deferred file, got {files}"
+    events = [json.loads(line) for line in files[0].read_text().splitlines()[1:]]
+    assert [event["role"] for event in events] == ["user", "assistant"]
+    assert [event["text"] for event in events] == [
+        "codex event user turn",
+        "codex assistant turn",
+    ]
 
 
 # ---------------------------------------------------------------------------
