@@ -129,6 +129,37 @@ def _count_tokens(text: str) -> int:
         return _char4_count(text)
 
 
+def preflight_crypto_or_exit() -> None:
+    """Block the run loudly if crypto is unconfigured.
+
+    Bench uses a FRESH per-row ``MemoryStore`` rooted in a unique tmp
+    directory (``/tmp/lme_blind_*/row-*/lancedb/``). Per-row tmp dirs
+    have no pre-existing ``.crypto.key`` file, and the home-directory
+    ``~/.iai-mcp/.crypto.key`` does NOT propagate into per-row tmp
+    stores. The only crypto state that reaches the per-row store is
+    ``IAI_MCP_CRYPTO_PASSPHRASE`` from the process environment.
+
+    Therefore D1 requires the env var; the file-backend keychain at the
+    user's home is irrelevant to bench execution and was a false positive
+    in the original pre-flight (smoke-caught 2026-05-11).
+
+    On failure: prints a message to stderr explaining the per-row
+    isolation pattern and naming the env var, then raises
+    ``SystemExit(2)``.
+    """
+    if os.environ.get("IAI_MCP_CRYPTO_PASSPHRASE"):
+        return
+    print(
+        "[LME] FATAL: crypto unconfigured. Bench uses per-row isolated "
+        "MemoryStore tmp dirs; the home-directory ~/.iai-mcp/.crypto.key "
+        "keychain does NOT propagate to per-row tmp stores. "
+        "Set IAI_MCP_CRYPTO_PASSPHRASE in env before invoking the harness.",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(2)
+
+
 def _percentile(xs: list[int], p: float) -> int:
     if not xs:
         return 0
@@ -487,7 +518,41 @@ def main(argv: list[str] | None = None) -> int:
             "ChromaDB default — bench-only swap, production unchanged."
         ),
     )
+    # Checkpoint disposition flags. Default behaviour (no flag):
+    # auto-clean when the prior checkpoint contains ERROR rows, keep it
+    # otherwise. --resume opts into the old keep-no-matter-what behaviour;
+    # --fresh force-cleans even a SUCCESS-only checkpoint. The two are
+    # mutually exclusive because the auto-clean default ALREADY handles the
+    # common "errored run, retry from scratch" case.
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Keep the existing checkpoint as-is even if it contains rows "
+            "classified as ERROR. Without this flag, a checkpoint containing "
+            "prior errors is auto-cleaned (the default; errors are usually a "
+            "fail-fast crypto / env miss and the right action is to fix the "
+            "environment and rerun from scratch). Mutually exclusive with "
+            "--fresh."
+        ),
+    )
+    resume_group.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Force-clean the checkpoint even if it contains no errors. "
+            "Mutually exclusive with --resume."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # Fail-loud crypto pre-flight BEFORE any adapter load / row work.
+    # If IAI_MCP_CRYPTO_PASSPHRASE is not set, per-row store.insert(...)
+    # would raise on the encryption path; the row-level except previously
+    # folded those into R@5 as silent MISS, producing clean-looking 0.000
+    # JSON. Now: SystemExit(2) before any row is touched.
+    preflight_crypto_or_exit()
 
     print(
         f"[LME] blind run starting "
@@ -565,6 +630,57 @@ def main(argv: list[str] | None = None) -> int:
     # checkpoint (matched by question_id).
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else Path(str(args.out) + ".jsonl")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Checkpoint disposition gate. Decide BEFORE the resume scan whether
+    # to keep the file or unlink and start fresh. Three paths:
+    #   1. --fresh           -> always unlink (even on SUCCESS-only).
+    #   2. prior errors + no --resume -> auto-clean + verbatim phrase.
+    #   3. otherwise         -> leave checkpoint; the existing resume
+    #                           scan re-checks `.exists()` and picks it up.
+    if checkpoint_path.exists():
+        prior_error_count = 0
+        prior_total_count = 0
+        with open(checkpoint_path, "r", encoding="utf-8") as cp_dispo:
+            for line in cp_dispo:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    # Corrupt line — the existing resume scan already
+                    # logs + skips these. Don't count as error for
+                    # disposition (the next resume scan will warn).
+                    continue
+                prior_total_count += 1
+                # Recognise BOTH the new `classification == "ERROR"`
+                # shape AND the legacy `"error" in rec` shape.
+                if (
+                    rec.get("classification") == "ERROR"
+                    or "error" in rec
+                ):
+                    prior_error_count += 1
+
+        if args.fresh:
+            print(
+                f"[LME] --fresh: discarding {prior_total_count}-row "
+                f"checkpoint at {checkpoint_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+            checkpoint_path.unlink()
+        elif prior_error_count > 0 and not args.resume:
+            # Verbatim phrase contract — grepped literally by reviewer
+            # tooling. Do NOT pluralise "1 errors" / restructure.
+            print(
+                f"[LME] Resuming from prior run with {prior_error_count} "
+                f"errors; starting fresh. Pass --resume to keep checkpoint.",
+                file=sys.stderr,
+                flush=True,
+            )
+            checkpoint_path.unlink()
+        # else: keep checkpoint; the existing resume scan below picks it up.
+
     completed_ids: set[str] = set()
     if checkpoint_path.exists():
         with open(checkpoint_path, "r", encoding="utf-8") as cp_f:
@@ -585,7 +701,16 @@ def main(argv: list[str] | None = None) -> int:
                 if not qid:
                     continue
                 completed_ids.add(qid)
-                if "error" in rec and isinstance(rec.get("error"), dict):
+                # Recognise BOTH the new top-level `classification == "ERROR"`
+                # shape AND the legacy `"error" in rec` shape (already-on-disk
+                # checkpoints written before this patch landed).
+                is_error_row = (
+                    rec.get("classification") == "ERROR"
+                    or (
+                        "error" in rec and isinstance(rec.get("error"), dict)
+                    )
+                )
+                if is_error_row:
                     # Resumed error row: count as full miss for both prongs.
                     errors.append(
                         {
@@ -653,7 +778,13 @@ def main(argv: list[str] | None = None) -> int:
             r10_y_values.append(res["r_at_10_pipeline"])
             query_tokens.append(res["query_tokens"])
             session_tokens.append(res["inserted_text_tokens"])
-            _checkpoint_append(res)
+            # Splice classification at append time so the on-disk JSONL
+            # agrees with the in-memory per_row list. Keep `_run_one_row`
+            # itself pure — it knows nothing about the ERROR / SUCCESS
+            # taxonomy.
+            res_with_class = dict(res)
+            res_with_class["classification"] = "SUCCESS"
+            _checkpoint_append(res_with_class)
             elapsed = time.time() - run_t0
             print(
                 f"[LME] row {i+1}/{len(row_order)} qid={qid} "
@@ -682,10 +813,16 @@ def main(argv: list[str] | None = None) -> int:
             query_tokens.append(0)
             session_tokens.append(0)
             # Persist the error row to checkpoint so a restart skips it.
+            # Top-level classification="ERROR" tag so the resume scan +
+            # auto-clean disposition can distinguish ERROR rows from
+            # genuine MISS rows without parsing the embedded error
+            # payload. The legacy `error` payload is preserved for
+            # backward compat with already-on-disk checkpoints.
             _checkpoint_append(
                 {
                     "question_id": qid,
                     "question_type": row.get("question_type", "unknown"),
+                    "classification": "ERROR",
                     "error": err_payload,
                 }
             )
@@ -706,6 +843,23 @@ def main(argv: list[str] | None = None) -> int:
 
     def _mean(xs: list[float]) -> float:
         return (sum(xs) / len(xs)) if xs else 0.0
+
+    # Honest-disclosure summary triple. Derived from already-tracked
+    # structures so resumed rows (which append to per_row / errors in the
+    # checkpoint scan above) are counted alongside freshly-run rows.
+    # `r_at_5_retrieve` is the canonical hit indicator — matches the
+    # `r5_x_values` aggregate used for R@5_retrieve below.
+    n_hits = sum(
+        1
+        for r in per_row
+        if float(r.get("r_at_5_retrieve", 0.0)) == 1.0
+    )
+    n_misses = sum(
+        1
+        for r in per_row
+        if float(r.get("r_at_5_retrieve", 0.0)) == 0.0
+    )
+    n_errors = len(errors)
 
     out = {
         "split": args.split,
@@ -735,6 +889,13 @@ def main(argv: list[str] | None = None) -> int:
             statistics.fmean(session_tokens) if session_tokens else 0.0
         ),
         "errors": errors,
+        # ERROR-vs-MISS honest-disclosure triple. R@5 / R@10 means stay
+        # computed over the union of success + error rows for backward
+        # compat; the triple below is what the reviewer asked for to make
+        # silent zeros impossible.
+        "n_hits": n_hits,
+        "n_misses": n_misses,
+        "n_errors": n_errors,
         "hard_limit": args.limit,
         "metric_def": (
             "Session-ID hit-at-k: R@k = 1.0 if any of top-k retrieved records "
@@ -749,6 +910,11 @@ def main(argv: list[str] | None = None) -> int:
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
 
+    # ERROR-vs-MISS triple on the DONE line so the reviewer can see at a
+    # glance whether a 0.000 R@5 was a real product miss or an environment
+    # misconfiguration. `errors=N` retained for grep-compat with already-
+    # saved bench logs; the new `hits=N misses=N errors=N` triple is the
+    # honest-disclosure surface.
     print(
         f"[LME] DONE n_rows={out['n_rows']} "
         f"R@5_retrieve={out['r_at_5_retrieve']:.3f} "
@@ -757,7 +923,8 @@ def main(argv: list[str] | None = None) -> int:
         f"R@10_retrieve={out['r_at_10_retrieve']:.3f} "
         f"R@10_pipeline={out['r_at_10_pipeline']:.3f} "
         f"lift_R@10={out['r_at_10_lift']:+.3f} "
-        f"errors={len(errors)} -> {args.out}",
+        f"hits={n_hits} misses={n_misses} errors={n_errors} "
+        f"-> {args.out}",
         file=sys.stderr,
         flush=True,
     )
