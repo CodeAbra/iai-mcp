@@ -1,4 +1,7 @@
-"""-- atomic daemon state persistence ( / ).
+# Canonical FSM state lives in ``lifecycle_state.json`` (LifecycleStateRecord).
+# This module's ``fsm_state`` field is the legacy view; ``fsm_reconcile`` at
+# daemon startup compares the two and warns on disagreement.
+"""Atomic daemon state persistence.
 
 State file at ~/.iai-mcp/.daemon-state.json holds:
 - fsm_state               -- WAKE / TRANSITIONING / SLEEP / DREAMING

@@ -65,6 +65,90 @@ DEDUP_COS_THRESHOLD = 0.95
 MIN_CAPTURE_LEN = 12
 MAX_CAPTURE_LEN = 8000
 
+# Bounded retry policy for `.failed-*` deferred-capture evidence files.
+# A file is retried up to FAILED_MAX_ATTEMPTS times with exponential
+# backoff (60s, 120s, 240s); after that it transitions to
+# .permanent-failed-<ts>.jsonl as a terminal evidence state and a
+# `permanent_capture_failure` event is emitted at severity=critical.
+FAILED_MAX_ATTEMPTS: int = 3
+FAILED_BACKOFF_BASE_SEC: float = 60.0
+
+_FAILED_ATTEMPT_RE = re.compile(r"-attempt-(\d+)\.jsonl$")
+_FAILED_SHAPE_RE = re.compile(r"^(.+?)\.failed-(\d+)(?:-attempt-\d+)?\.jsonl$")
+
+
+def _parse_failed_attempt(name: str) -> int:
+    """Return the prior-attempt count encoded in a deferred-capture filename.
+
+    Mapping:
+      * ``<base>.failed-<ts>-attempt-<n>.jsonl`` -> n
+      * ``<base>.failed-<ts>.jsonl`` (legacy shape) -> 1
+      * any name without ``.failed-`` (clean file) -> 0
+    """
+    m = _FAILED_ATTEMPT_RE.search(name)
+    if m:
+        return int(m.group(1))
+    if ".failed-" in name:
+        return 1
+    return 0
+
+
+def _advance_failed_path(
+    fpath: Path,
+    store: "MemoryStore",
+    *,
+    first_error: str,
+    log_path: Path,
+) -> Path:
+    """Rename ``fpath`` forward to the next-attempt or terminal evidence shape.
+
+    Clean -> attempt-1, attempt-N -> attempt-(N+1), and on the fourth
+    failure (would-be-attempt-4) the file transitions to
+    ``.permanent-failed-<ts>.jsonl`` and a ``permanent_capture_failure``
+    event is emitted at severity=critical.
+    """
+    prior_attempt = _parse_failed_attempt(fpath.name)
+    next_attempt = prior_attempt + 1
+    m = _FAILED_SHAPE_RE.match(fpath.name)
+    if m:
+        base = m.group(1)
+        ts_str = m.group(2)
+    else:
+        base = fpath.stem
+        ts_str = str(int(time.time()))
+    if next_attempt > FAILED_MAX_ATTEMPTS:
+        new_name = f"{base}.permanent-failed-{ts_str}.jsonl"
+        failed_path = fpath.with_name(new_name)
+        fpath.rename(failed_path)
+        try:
+            from iai_mcp.events import write_event
+
+            write_event(
+                store,
+                "permanent_capture_failure",
+                {
+                    "file": new_name,
+                    "first_error": first_error,
+                    "attempts": FAILED_MAX_ATTEMPTS,
+                },
+                severity="critical",
+                domain="ops",
+            )
+        except Exception:  # noqa: BLE001 -- fail-safe boundary
+            try:
+                with log_path.open("a") as logf:
+                    logf.write(
+                        f"{datetime.now(timezone.utc).isoformat()} "
+                        f"permanent_capture_failure-event-skipped {new_name}\n"
+                    )
+            except Exception:
+                pass
+        return failed_path
+    new_name = f"{base}.failed-{ts_str}-attempt-{next_attempt}.jsonl"
+    failed_path = fpath.with_name(new_name)
+    fpath.rename(failed_path)
+    return failed_path
+
 
 def _detect_language(text: str) -> str:
     """Best-effort ISO-639-1 via langdetect; 'en' on any failure."""
@@ -533,12 +617,21 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
             continue
         if _LIVE_ACTIVE_RE.search(fpath.name):
             continue
-        # Skip the `.failed-<ts>.jsonl` evidence files — they are NOT
-        # supposed to be reprocessed. The existing convention names them
-        # via with_suffix(".failed-<ts>.jsonl") which leaves a `.failed-N`
-        # marker in the basename followed by `.jsonl`.
-        if ".failed-" in fpath.name:
+        # Terminal evidence — never reprocess.
+        if ".permanent-failed-" in fpath.name:
             continue
+        # `.failed-<ts>[-attempt-N].jsonl` is a retry candidate when its
+        # per-attempt backoff has elapsed. Younger files are left untouched
+        # so a flaky downstream can recover before the file ages forward.
+        if ".failed-" in fpath.name:
+            attempt_n = _parse_failed_attempt(fpath.name)
+            backoff_sec = FAILED_BACKOFF_BASE_SEC * (2 ** (attempt_n - 1))
+            try:
+                file_mtime = fpath.stat().st_mtime
+            except OSError:
+                continue
+            if (time.time() - file_mtime) < backoff_sec:
+                continue
         candidates.append(fpath)
 
     for fpath in candidates:
@@ -600,6 +693,20 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
                 reason = result.get("reason", "")
                 if status == "inserted":
                     counts["events_inserted"] += 1
+                    try:
+                        from iai_mcp.memory_bank import append_recent_record
+
+                        rid_str = result.get("record_id")
+                        if rid_str:
+                            rec = store.get(UUID(rid_str))
+                            if rec is not None:
+                                append_recent_record(store, rec)
+                    except Exception:  # noqa: BLE001 -- best-effort fail-safe boundary
+                        log.warning(
+                            "bank-recent append failed for record %s",
+                            result.get("record_id"),
+                            exc_info=True,
+                        )
                 elif status == "reinforced":
                     counts["events_reinforced"] += 1
                 elif status == "skipped" and reason.startswith("insert-failed:"):
@@ -618,8 +725,12 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
                 # the insert-failed code path inside capture_turn (store.insert
                 # raised, capture_turn swallowed and returned status=skipped
                 # reason=insert-failed:*).
-                failed_path = fpath.with_suffix(f".failed-{int(time.time())}.jsonl")
-                fpath.rename(failed_path)
+                failed_path = _advance_failed_path(
+                    fpath,
+                    store,
+                    first_error=file_first_error or "unknown",
+                    log_path=log_path,
+                )
                 with log_path.open("a") as logf:
                     logf.write(
                         f"{datetime.now(timezone.utc).isoformat()} insert-failed "
@@ -633,8 +744,12 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
             try:
                 # Preserve evidence: rename so the next drain pass skips it
                 # AND a human can inspect the failure.
-                failed_path = fpath.with_suffix(f".failed-{int(time.time())}.jsonl")
-                fpath.rename(failed_path)
+                failed_path = _advance_failed_path(
+                    fpath,
+                    store,
+                    first_error=file_first_error or repr(e),
+                    log_path=log_path,
+                )
                 with log_path.open("a") as logf:
                     logf.write(
                         f"{datetime.now(timezone.utc).isoformat()} failed "
@@ -643,4 +758,10 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
             except Exception:
                 pass
             counts["files_failed"] += 1
+    try:
+        from iai_mcp.memory_bank import prune_recent_windows
+
+        prune_recent_windows()
+    except Exception:  # noqa: BLE001 -- best-effort fail-safe boundary
+        log.warning("bank-recent prune failed", exc_info=True)
     return counts

@@ -13,10 +13,9 @@
     path. The CLI's stdout is forwarded AND the hook's log file for today
     contains the substring `cache-miss absent` (this phrase is the
     discriminator that keeps the test RED on current `main`).
-(d) When the cache file exists but mtime is 25h old, the hook falls through
-    to the live CLI path. The CLI's stdout is forwarded AND the hook's log
-    file for today contains the substring `cache-miss stale` (same
-    discriminator role as (c)).
+(d) When the cache file exists and mtime is 25h old, the hook still
+    prints the cache content, logs `cache-hit age=`, and exits 0 WITHOUT
+    invoking the CLI (no freshness expiry).
 """
 from __future__ import annotations
 
@@ -201,8 +200,8 @@ def test_hook_reads_cache_when_fresh(tmp_path):
     log_path = _today_log_path(home)
     assert log_path.exists(), f"hook log missing: {log_path}"
     log_text = log_path.read_text(encoding="utf-8")
-    assert "cache-hit fresh" in log_text, (
-        f"expected 'cache-hit fresh' marker in log; got:\n{log_text}"
+    assert "cache-hit age=" in log_text, (
+        f"expected 'cache-hit age=' marker in log; got:\n{log_text}"
     )
 
 
@@ -242,39 +241,40 @@ def test_hook_falls_back_when_cache_absent(tmp_path):
 
 # ---------------------------------------------------------------------- (d)
 
-def test_hook_falls_back_when_cache_stale(tmp_path):
+def test_hook_serves_stale_cache(tmp_path):
     assert HOOK_PATH.exists(), f"hook script missing: {HOOK_PATH}"
     home = tmp_path / "home"
     home.mkdir()
     (home / ".iai-mcp").mkdir()
 
     stale_cache = home / CACHE_REL
-    stale_cache.write_text("# stale\nold content that must be ignored\n")
+    cache_content = "# stale\nold content that must be ignored"
+    stale_cache.write_text(cache_content)
     # Backdate mtime to 25 hours ago.
     twenty_five_h_ago = time.time() - (25 * 3600)
     os.utime(stale_cache, (twenty_five_h_ago, twenty_five_h_ago))
 
+    # BOOM-on-exec stub: if the hook ever calls the CLI, the test fails.
     stub_dir = tmp_path / "stub"
     stub_dir.mkdir()
-    _make_stub_cli(stub_dir, f"#!/usr/bin/env bash\nprintf '%s' '{SENTINEL}'\nexit 0\n")
+    _make_stub_cli(stub_dir, "#!/usr/bin/env bash\necho CLI_SHOULD_NOT_BE_CALLED\nexit 0\n")
     (home / ".iai-mcp" / ".cli-path").write_text(str(stub_dir / "iai-mcp"))
 
     proc = _run_hook(home)
     assert proc.returncode == 0, proc.stderr
-    assert SENTINEL in proc.stdout, (
-        f"fallback CLI sentinel not in stdout. stdout={proc.stdout!r}"
+    assert proc.stdout == cache_content, (
+        f"hook did not return cache verbatim. stdout={proc.stdout!r}"
     )
-    # Stale content must NOT be emitted.
-    assert "old content that must be ignored" not in proc.stdout, (
-        "stale cache leaked through"
+    assert "CLI_SHOULD_NOT_BE_CALLED" not in proc.stdout, (
+        "hook called the CLI instead of reading the stale cache"
     )
 
-    # HARD DISCRIMINATOR: same role as in test (c). This marker is only
-    # written by the new cache-first branch's stale path, so the assertion
-    # keeps the test RED on current `main`.
     log_path = _today_log_path(home)
     assert log_path.exists(), f"hook log missing: {log_path}"
     log_text = log_path.read_text(encoding="utf-8")
-    assert "cache-miss stale" in log_text, (
-        f"expected 'cache-miss stale' marker in log; got:\n{log_text}"
+    assert "cache-hit age=" in log_text, (
+        f"expected 'cache-hit age=' marker in log; got:\n{log_text}"
+    )
+    assert "cache-miss stale" not in log_text, (
+        f"deleted marker 'cache-miss stale' still present in log; got:\n{log_text}"
     )

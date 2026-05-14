@@ -42,7 +42,7 @@ ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   echo "$ts session=$session_id source=$source_evt"
 } >> "$log" 2>/dev/null
 
-# Read the daemon-written cache when fresh (mtime within 24h) and non-empty.
+# Read the daemon-written cache whenever it is non-empty (no age cap).
 # Each branch writes a contract log marker. Falls through to the live CLI path
 # on any miss.
 cache_path="$HOME/.iai-mcp/.session-start-payload.cached.md"
@@ -54,17 +54,13 @@ if [[ -s "$cache_path" ]]; then
   else
     now_epoch=$(date +%s)
     age=$(( now_epoch - cache_mtime ))
-    if [[ $age -lt 86400 ]]; then
-      cache_out=$(head -c 10000 "$cache_path" 2>/dev/null || true)
-      if [[ -n "$cache_out" ]]; then
-        printf '%s' "$cache_out"
-        echo "$ts cache-hit fresh age=${age}s bytes=${#cache_out}" >> "$log" 2>/dev/null
-        exit 0
-      fi
-      echo "$ts cache-miss empty (file existed but read returned 0 bytes)" >> "$log" 2>/dev/null
-    else
-      echo "$ts cache-miss stale age=${age}s" >> "$log" 2>/dev/null
+    cache_out=$(head -c 10000 "$cache_path" 2>/dev/null || true)
+    if [[ -n "$cache_out" ]]; then
+      printf '%s' "$cache_out"
+      echo "$ts cache-hit age=${age}s bytes=${#cache_out}" >> "$log" 2>/dev/null
+      exit 0
     fi
+    echo "$ts cache-miss empty (file existed but read returned 0 bytes)" >> "$log" 2>/dev/null
   fi
 elif [[ -e "$cache_path" ]]; then
   echo "$ts cache-miss empty (zero-byte file)" >> "$log" 2>/dev/null
@@ -72,18 +68,29 @@ else
   echo "$ts cache-miss absent" >> "$log" 2>/dev/null
 fi
 
-# Locate the CLI. Prefer the cached path; otherwise scan known install dirs
-# and seed the cache for next run.
+# Locate the CLI. Lookup order:
+#   1. IAI_MCP_SESSION_RECALL_CLI environment variable (developer override
+#      for non-standard install locations; export in your shell init).
+#   2. ~/.iai-mcp/.cli-path cache file (auto-populated below once the
+#      candidates array finds a working binary).
+#   3. Generic install locations in the candidates array.
+# Only generic install paths are baked into the source; developer-specific
+# paths belong in the env var or the cache, never here.
 cli_cache="$HOME/.iai-mcp/.cli-path"
 iai_cli=""
-if [[ -f "$cli_cache" ]]; then
+if [[ -n "${IAI_MCP_SESSION_RECALL_CLI:-}" && -x "$IAI_MCP_SESSION_RECALL_CLI" ]]; then
+  iai_cli="$IAI_MCP_SESSION_RECALL_CLI"
+fi
+if [[ -z "$iai_cli" && -f "$cli_cache" ]]; then
   cached=$(cat "$cli_cache" 2>/dev/null || true)
   [[ -x "$cached" ]] && iai_cli="$cached"
 fi
 if [[ -z "$iai_cli" ]]; then
-  for candidate in \
-    "$HOME/IAI-MCP/.venv/bin/iai-mcp" \
-    "/usr/local/bin/iai-mcp"; do
+  candidates=(
+    "$HOME/IAI-MCP/.venv/bin/iai-mcp"
+    "/usr/local/bin/iai-mcp"
+  )
+  for candidate in "${candidates[@]}"; do
     if [[ -x "$candidate" ]]; then
       iai_cli="$candidate"
       printf '%s' "$iai_cli" > "$cli_cache" 2>/dev/null || true

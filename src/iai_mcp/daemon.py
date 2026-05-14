@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -35,6 +36,8 @@ from pathlib import Path
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
+
+log = logging.getLogger(__name__)
 
 from iai_mcp import s4
 from iai_mcp.concurrency import ProcessLock, serve_control_socket  # noqa: F401 -- kept for backward compat (serve_control_socket STAYS in concurrency.py for the test suite)
@@ -625,6 +628,13 @@ async def _tick_body(
         # store lock during DREAMING). Best-effort; never raises.
         try:
             await asyncio.to_thread(_write_session_start_cache, store)
+        except Exception:
+            pass
+
+        try:
+            from iai_mcp.memory_bank import write_processed_salience_top_n
+
+            await asyncio.to_thread(write_processed_salience_top_n, store)
         except Exception:
             pass
 
@@ -1312,6 +1322,42 @@ async def main() -> int:
             write_event(store, "prewarm_failed", {"error": str(exc)}, severity="warning")
         except Exception:
             pass
+
+    # Detect drift between the canonical and legacy state files. Detect-only:
+    # the canonical lifecycle_state.json is the source of truth. A mismatch
+    # is surfaced via a warning-severity event and a stdlib log line so an
+    # operator can audit; the daemon does not auto-correct.
+    try:
+        from iai_mcp.fsm_reconcile import reconcile_fsm_state
+
+        _drift_report = reconcile_fsm_state()
+        if _drift_report.get("drift") is True:
+            log.warning(
+                "fsm_drift_detected canonical=%s legacy=%s",
+                _drift_report.get("canonical"),
+                _drift_report.get("legacy"),
+            )
+            try:
+                write_event(
+                    store,
+                    "fsm_drift_detected",
+                    _drift_report,
+                    severity="warning",
+                    domain="ops",
+                )
+            except Exception:  # noqa: BLE001 -- fail-safe
+                pass
+    except Exception:  # noqa: BLE001 -- fail-safe boundary
+        pass
+
+    # Archive any HIBERNATION-stuck.bak recovery artifacts left by prior
+    # daemon lives. Pure disk hygiene; fail-safe.
+    try:
+        from iai_mcp.archive_backups import archive_stuck_backups
+
+        archive_stuck_backups()
+    except Exception:  # noqa: BLE001 -- fail-safe boundary
+        pass
 
     lock = ProcessLock()
 

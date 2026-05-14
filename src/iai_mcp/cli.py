@@ -1782,6 +1782,30 @@ def cmd_crypto_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bank_recall(args: argparse.Namespace) -> int:
+    """Print a JSON memory_recall-shape response to stdout, substring-only.
+
+    Reads the disk-side bank/processed + bank/recent artifacts without
+    opening LanceDB or loading the embedder. CryptoKey resolution
+    happens lazily inside ``read_recent_records`` when ``key`` is None.
+    """
+    import json as _json
+
+    from iai_mcp.memory_bank import bank_recall_substring
+
+    include_processed = not getattr(args, "recent_only", False)
+    include_recent = not getattr(args, "processed_only", False)
+
+    result = bank_recall_substring(
+        args.query,
+        limit=args.limit,
+        include_processed=include_processed,
+        include_recent=include_recent,
+    )
+    print(_json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def cmd_topology(args: argparse.Namespace) -> int:
     """Print live small-world topology snapshot.
 
@@ -3192,6 +3216,32 @@ def _build_parser() -> argparse.ArgumentParser:
         help="skip the interactive [y/N] prompt",
     )
     lc_unlock.set_defaults(func=cmd_lifecycle_force_unlock)
+
+    br = sub.add_parser(
+        "bank-recall",
+        help=(
+            "substring recall over bank/processed + bank/recent without "
+            "booting the daemon. Used by the wrapper as a socket-dead "
+            "fallback path."
+        ),
+    )
+    br.add_argument("--query", required=True, help="cue substring to match")
+    br.add_argument(
+        "--limit", type=int, default=20, help="max hits (default 20)"
+    )
+    br.add_argument(
+        "--processed-only", action="store_true", default=False
+    )
+    br.add_argument(
+        "--recent-only", action="store_true", default=False
+    )
+    br.add_argument(
+        "--json",
+        action="store_true",
+        default=True,
+        help="emit JSON to stdout (current default; --no-json is reserved)",
+    )
+    br.set_defaults(func=cmd_bank_recall)
 
     return parser
 

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-13
+
+### Added
+
+- **Memory bank** — denormalized read-side caches under `~/.iai-mcp/.memory-bank/`. Two tiers:
+  - `processed/salience-top-N.jsonl`: daemon writes the top-1000 records by graph-centrality salience once per REM-loop completion. Plaintext JSONL with base64-encoded embeddings.
+  - `recent/window-YYYY-MM-DD.jsonl`: each drained capture is mirrored as an AES-256-GCM encrypted JSONL line. AAD is bound to the window-file's date string so a cold reader can decrypt without knowing any record id. Retention sweep (default 30 days) runs at the end of every drain pass.
+- **New CLI command `iai-mcp bank-recall`** — substring fallback over the bank tiers without booting the daemon or loading the embedder. Returns a `memory_recall`-shaped JSON response so the wrapper's socket-dead fallback path is wire-compatible.
+- **FSM drift detection** (`fsm_reconcile.py`): daemon startup compares the canonical `lifecycle_state.json` and legacy `.daemon-state.json`; a mismatch emits a `fsm_drift_detected` warning event. Detect-only — no auto-correction.
+- **Backup archiver** (`archive_backups.py`): daemon startup moves any leftover `lifecycle_state.json.HIBERNATION-stuck*.bak` recovery artifacts into `~/.iai-mcp/archive/` with mtime-stamped names. Idempotent and fail-safe.
+- **Session-recall hook**: `IAI_MCP_SESSION_RECALL_CLI` environment variable for developer-override of the CLI binary path. CLI lookup now uses a bash array instead of a backslash-continuation for-loop.
+- 18 new regression tests across 5 test files covering bank writers, bank-recall CLI, retry policy, FSM reconcile, and backup archiver.
+
+### Changed
+
+- **Deferred-capture retry policy**: failed `.jsonl` files are now retried up to 3 times with exponential backoff (60 s, 120 s, 240 s). After the third failure the file transitions to `.permanent-failed-<ts>.jsonl` and a `permanent_capture_failure` event is emitted at severity `critical`. Terminal files are never reprocessed. Previously, failed files were renamed once and skipped forever.
+- **Session-recall hook**: removed the 24-hour staleness cap on the precache file. The daemon-written cache is now served whenever it exists and reads non-empty, regardless of age. Log marker changed from `cache-hit fresh` to `cache-hit age=`.
+
 ## [0.3.2] — 2026-05-13
 
 ### Security
@@ -72,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial public release. Local memory daemon for MCP-over-stdio hosts. Verbatim recall, ambient capture, sleep-cycle consolidation, encrypted-at-rest LanceDB store, configurable operating profile.
 
+[0.4.0]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.4.0
+[0.3.2]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.3.2
+[0.3.1]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.3.1
 [0.3.0]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.1.0
